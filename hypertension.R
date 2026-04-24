@@ -176,6 +176,4 @@ cost <- cs |>
     num_home_health_events = HHAEVNTS # home health visits
   )
 
-# %% join Fall and Cost
-fall <- fall |>
-  left_join(cost, by = "respondent_id")
+
