@@ -24,7 +24,7 @@ fall <- sf_fall |>
     respondent_id = PUF_ID,
     survey_year = SURVEYYR,
     weight_fall = PUFFWGT,
-    starts_with("PUFF0"), # 100 Fall BRR replicate weights
+    matches("^PUFF[0-9]{3}$"), # 100 Fall BRR replicate weights (PUFF001–PUFF100)
 
     # --- Medicare enrollment flags ---
     # These are annual flags: 1 = enrolled at any point during 2023.
@@ -128,7 +128,7 @@ cost <- cs |>
   select(
     respondent_id = PUF_ID,
     weight_cost = CSPUFWGT, # Cost-specific analytic weight
-    starts_with("CSPUF0"), # 100 Cost BRR replicate weights
+    matches("^CSPUF[0-9]{3}$"), # 100 Cost BRR replicate weights (CSPUF001–CSPUF100)
 
     # Quality-control demographics — should match Fall after merge.
     # Discrepancies would indicate a join error.
@@ -176,4 +176,166 @@ cost <- cs |>
     num_home_health_events = HHAEVNTS # home health visits
   )
 
+# %% Recode fall: add binary hypertension flag
+fall_c <- fall |>
+  mutate(hypertension = if_else(has_hypertension == 1, 1L, 0L))
 
+# %% Survey designs
+# Fall: full sample; FFS sub-population extracted via subset() to preserve design
+design_fall <- svrepdesign(
+  data = fall_c,
+  weights = ~weight_fall,
+  repweights = "PUFF[0-9]{3}",
+  type = "BRR",
+  combined.weights = TRUE
+)
+design_fall_ffs <- subset(design_fall, in_ffs == 1)
+
+# Cost supplement: FFS-only by construction
+design_cost <- svrepdesign(
+  data = cost,
+  weights = ~weight_cost,
+  repweights = "CSPUF[0-9]{3}",
+  type = "BRR",
+  combined.weights = TRUE
+)
+
+# %% Step 1 — Fall: hypertension prevalence by demographic cell
+# DEM_AGE, DEM_SEX, DEM_RACE are all categorical in the PUF (codes 1–3, 1–2, 1–4)
+# and use the same coding as CSP_AGE, CSP_SEX, CSP_RACE in the cost supplement.
+# Cell structure: age (3) × sex (2) × race (4) = 24 cells
+cells_fall <- svyby(
+  ~hypertension,
+  ~ age + sex + race,
+  design_fall_ffs,
+  svymean,
+  na.rm = TRUE
+) |>
+  as_tibble() |>
+  rename(hyp_prev = hypertension, se_hyp = se)
+
+# %% Step 2 — Cost: mean spending by demographic cell
+cells_cost <- svyby(
+  ~ spend_total + spend_medicare_paid + spend_out_of_pocket,
+  ~ cs_age + cs_sex + cs_race,
+  design_cost,
+  svymean,
+  na.rm = TRUE
+) |>
+  as_tibble() |>
+  rename(
+    age = cs_age,
+    sex = cs_sex,
+    race = cs_race,
+    se_spend_total = `se.spend_total`,
+    se_spend_medicare = `se.spend_medicare_paid`,
+    se_spend_oop = `se.spend_out_of_pocket`
+  )
+
+# %% Step 3 — Join cells on shared demographic codes
+cells <- inner_join(cells_fall, cells_cost, by = c("age", "sex", "race")) |>
+  filter(!is.na(hyp_prev), !is.na(spend_total))
+
+cat(sprintf(
+  "Cells available for ecological regression: %d / 24\n",
+  nrow(cells)
+))
+
+# %% Step 4 — Ecological weighted regression
+# hyp_prev is on [0, 1]; coefficient = spending gap between 0% and 100% prevalence.
+# Weight each cell by inverse variance of the prevalence estimate so noisier cells
+# contribute less.
+eco_total <- lm(spend_total ~ hyp_prev, data = cells, weights = 1 / se_hyp^2)
+eco_medicare <- lm(
+  spend_medicare_paid ~ hyp_prev,
+  data = cells,
+  weights = 1 / se_hyp^2
+)
+eco_oop <- lm(
+  spend_out_of_pocket ~ hyp_prev,
+  data = cells,
+  weights = 1 / se_hyp^2
+)
+
+premium_total <- coef(eco_total)["hyp_prev"]
+premium_medicare <- coef(eco_medicare)["hyp_prev"]
+premium_oop <- coef(eco_oop)["hyp_prev"]
+
+cat(
+  "\n--- Spending premium per person (full hypertension → no hypertension) ---\n"
+)
+cat(sprintf("  Total spending:    %s\n", dollar(premium_total, accuracy = 1)))
+cat(sprintf(
+  "  Medicare paid:     %s\n",
+  dollar(premium_medicare, accuracy = 1)
+))
+cat(sprintf("  Out-of-pocket:     %s\n", dollar(premium_oop, accuracy = 1)))
+
+# %% Step 5 — Baseline: overall hypertension prevalence and FFS population size
+overall_prev <- svymean(~hypertension, design_fall_ffs, na.rm = TRUE)
+hyp_prev_est <- coef(overall_prev)[["hypertension"]]
+
+n_ffs_total <- coef(svytotal(~ I(in_ffs == 1), design_fall, na.rm = TRUE))[[1]]
+n_hyp <- n_ffs_total * hyp_prev_est
+
+cat(sprintf(
+  "\nBaseline: %.1f%% of FFS Medicare beneficiaries have hypertension (~%s people)\n",
+  hyp_prev_est * 100,
+  format(round(n_hyp, -3), big.mark = ",")
+))
+
+# %% Step 6 — Scenario table
+# "If hypertension prevalence falls by X%, per-person spending falls by
+#  X% × premium_total, and total FFS savings = (X% × n_hyp) × premium_total"
+scenarios <- tibble(reduction_pct = c(5, 10, 15, 20, 25, 30, 50)) |>
+  mutate(
+    label = paste0(reduction_pct, "%"),
+    persons_no_longer_hyp = round(n_hyp * reduction_pct / 100, -3),
+    savings_per_person_total = premium_total * reduction_pct / 100,
+    savings_per_person_medicare = premium_medicare * reduction_pct / 100,
+    savings_per_person_oop = premium_oop * reduction_pct / 100,
+    total_savings_billions = persons_no_longer_hyp * premium_total / 1e9
+  )
+
+scenarios |>
+  transmute(
+    `Reduction` = label,
+    `People affected` = format(persons_no_longer_hyp, big.mark = ","),
+    `Savings/person (total)` = dollar(savings_per_person_total, accuracy = 1),
+    `Savings/person (Medicare)` = dollar(
+      savings_per_person_medicare,
+      accuracy = 1
+    ),
+    `Savings/person (OOP)` = dollar(savings_per_person_oop, accuracy = 1),
+    `Total FFS savings` = paste0("$", round(total_savings_billions, 1), "B")
+  ) |>
+  print(n = Inf)
+
+# %% Visualization
+ggplot(scenarios, aes(x = reduction_pct, y = total_savings_billions)) +
+  geom_col(fill = "#2166AC", width = 0.7) +
+  geom_text(
+    aes(label = paste0("$", round(total_savings_billions, 1), "B")),
+    vjust = -0.5,
+    size = 3.8,
+    colour = "grey20"
+  ) +
+  scale_x_continuous(
+    breaks = scenarios$reduction_pct,
+    labels = paste0(scenarios$reduction_pct, "%")
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0("$", x, "B"),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Projected Annual Medicare FFS Savings from Reducing Hypertension",
+    subtitle = paste0(
+      "Ecological model: MCBS 2023 Fall (hypertension prevalence) linked to Cost Supplement (spending)\n",
+      "by demographic cell (age × sex × race) · survey-weighted · FFS beneficiaries only"
+    ),
+    x = "Reduction in hypertension prevalence",
+    y = "Annual savings (billions USD)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey50"))
