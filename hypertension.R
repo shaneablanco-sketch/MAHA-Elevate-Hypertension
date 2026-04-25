@@ -227,9 +227,9 @@ cells_cost <- svyby(
     age = cs_age,
     sex = cs_sex,
     race = cs_race,
-    se_spend_total = `se.spend_total`,
-    se_spend_medicare = `se.spend_medicare_paid`,
-    se_spend_oop = `se.spend_out_of_pocket`
+    se_spend_total = se1,
+    se_spend_medicare = se2,
+    se_spend_oop = se3
   )
 
 # %% Step 3 — Join cells on shared demographic codes
@@ -316,7 +316,7 @@ ggplot(scenarios, aes(x = reduction_pct, y = total_savings_billions)) +
   geom_col(fill = "#2166AC", width = 0.7) +
   geom_text(
     aes(label = paste0("$", round(total_savings_billions, 1), "B")),
-    vjust = -0.5,
+    vjust = 1.5,
     size = 3.8,
     colour = "grey20"
   ) +
@@ -326,7 +326,7 @@ ggplot(scenarios, aes(x = reduction_pct, y = total_savings_billions)) +
   ) +
   scale_y_continuous(
     labels = function(x) paste0("$", x, "B"),
-    expand = expansion(mult = c(0, 0.12))
+    expand = expansion(mult = c(0.12, 0))
   ) +
   labs(
     title = "Projected Annual Medicare FFS Savings from Reducing Hypertension",
@@ -339,3 +339,81 @@ ggplot(scenarios, aes(x = reduction_pct, y = total_savings_billions)) +
   ) +
   theme_minimal(base_size = 13) +
   theme(plot.subtitle = element_text(size = 9, colour = "grey50"))
+
+# %% Severity-based savings: merge Fall + Cost, hypertensives only
+# The two files use different PUF_ID schemes: Fall = 23XXXXXX, Cost = 923XXXXX.
+# The shared key is the sequential beneficiary number: fall_id - 23000000 == cost_id - 92300000.
+# bp_self_ctrl_reported (HLT_HYPECTRL): 1 = BP controlled, 2 = BP not controlled.
+# We use this as the severity proxy: uncontrolled BP = higher severity.
+# "X% severity reduction" = moving X% of the way from uncontrolled to controlled BP.
+merged <- fall_c |>
+  filter(in_ffs == 1, hypertension == 1) |>
+  select(respondent_id, age, sex, race, bp_self_ctrl_reported) |>
+  mutate(
+    .key         = respondent_id - 23000000,
+    bp_uncontrolled = if_else(bp_self_ctrl_reported == 2, 1L, 0L)
+  ) |>
+  inner_join(
+    cost |> mutate(.key = respondent_id - 92300000),
+    by = ".key"
+  ) |>
+  select(-.key, -respondent_id.y) |>
+  rename(respondent_id = respondent_id.x)
+
+cat(sprintf("\nHypertensives matched to cost file: %d records\n", nrow(merged)))
+cat(sprintf(
+  "BP uncontrolled: %d (%.1f%%) | controlled: %d (%.1f%%)\n",
+  sum(merged$bp_uncontrolled, na.rm = TRUE),
+  100 * mean(merged$bp_uncontrolled, na.rm = TRUE),
+  sum(merged$bp_uncontrolled == 0, na.rm = TRUE),
+  100 * mean(merged$bp_uncontrolled == 0, na.rm = TRUE)
+))
+
+design_sev <- svrepdesign(
+  data    = merged |> filter(!is.na(bp_uncontrolled)),
+  weights = ~weight_cost,
+  repweights = "CSPUF[0-9]{3}",
+  type    = "BRR",
+  combined.weights = TRUE
+)
+
+# Spending gap: uncontrolled vs controlled BP, adjusted for age/sex/race.
+# Coefficient = extra annual spend for a person with uncontrolled BP.
+# "Reducing severity by X%" scales this gap linearly: savings = X/100 * gap.
+fit_sev_total    <- svyglm(spend_total         ~ bp_uncontrolled + factor(age) + factor(sex) + factor(race), design_sev)
+fit_sev_medicare <- svyglm(spend_medicare_paid ~ bp_uncontrolled + factor(age) + factor(sex) + factor(race), design_sev)
+fit_sev_oop      <- svyglm(spend_out_of_pocket ~ bp_uncontrolled + factor(age) + factor(sex) + factor(race), design_sev)
+
+sev_gap_total    <- coef(fit_sev_total)[["bp_uncontrolled"]]
+sev_gap_medicare <- coef(fit_sev_medicare)[["bp_uncontrolled"]]
+sev_gap_oop      <- coef(fit_sev_oop)[["bp_uncontrolled"]]
+
+cat("\n--- Annual spending gap: uncontrolled vs controlled BP (adjusted) ---\n")
+cat(sprintf("  Total spending:    %s\n", dollar(sev_gap_total,    accuracy = 1)))
+cat(sprintf("  Medicare paid:     %s\n", dollar(sev_gap_medicare, accuracy = 1)))
+cat(sprintf("  Out-of-pocket:     %s\n", dollar(sev_gap_oop,      accuracy = 1)))
+
+# %% savings_for_severity_reduction(): individual-level savings model
+# If Joe reduces his BP severity by X%, he saves X/100 * gap dollars per year.
+savings_for_severity_reduction <- function(reduction_pct) {
+  tibble(
+    reduction_pct    = reduction_pct,
+    label            = paste0(reduction_pct, "%"),
+    savings_total    = sev_gap_total    * reduction_pct / 100,
+    savings_medicare = sev_gap_medicare * reduction_pct / 100,
+    savings_oop      = sev_gap_oop      * reduction_pct / 100
+  )
+}
+
+sev_scenarios <- map(c(10, 20, 30, 40, 50, 75, 100), savings_for_severity_reduction) |>
+  list_rbind()
+
+cat("\n--- Individual severity reduction scenario table ---\n")
+sev_scenarios |>
+  transmute(
+    `Severity reduction`        = label,
+    `Savings/year (total)`      = dollar(savings_total,    accuracy = 1),
+    `Savings/year (Medicare)`   = dollar(savings_medicare, accuracy = 1),
+    `Savings/year (OOP)`        = dollar(savings_oop,      accuracy = 1)
+  ) |>
+  print(n = Inf)
